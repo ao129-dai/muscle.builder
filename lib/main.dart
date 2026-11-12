@@ -1,15 +1,26 @@
 import 'dart:async';
 import 'dart:convert';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
+import 'firebase_options.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(const MuscleBuilderApp());
 }
 
 /// 記録が変更されたら +1 して、ホーム画面などに再読み込みを知らせる
 final ValueNotifier<int> recordsVersion = ValueNotifier<int>(0);
+
+/// タイムライン側で共有を取り消したら +1 して、記録画面に知らせる
+final ValueNotifier<int> sharedVersion = ValueNotifier<int>(0);
 
 class MuscleBuilderApp extends StatelessWidget {
   const MuscleBuilderApp({super.key});
@@ -24,7 +35,140 @@ class MuscleBuilderApp extends StatelessWidget {
         colorSchemeSeed: Colors.blue,
         scaffoldBackgroundColor: const Color(0xFFF5F6F8),
       ),
-      home: const MainScreen(),
+      home: const AuthGate(),
+    );
+  }
+}
+
+// ============================================================
+// ログイン状態の切り替え
+// ============================================================
+
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        if (snapshot.hasData) {
+          return const MainScreen();
+        }
+        return const LoginScreen();
+      },
+    );
+  }
+}
+
+// ============================================================
+// ログイン画面（Google）
+// ============================================================
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  bool loading = false;
+  String? error;
+
+  Future<void> signInWithGoogle() async {
+    setState(() {
+      loading = true;
+      error = null;
+    });
+
+    try {
+      final provider = GoogleAuthProvider();
+      if (kIsWeb) {
+        await FirebaseAuth.instance.signInWithPopup(provider);
+      } else {
+        await FirebaseAuth.instance.signInWithProvider(provider);
+      }
+    } on FirebaseAuthException catch (e) {
+      // ポップアップを自分で閉じた場合はエラー表示しない
+      final cancelled =
+          e.code == 'popup-closed-by-user' ||
+          e.code == 'cancelled-popup-request';
+      if (mounted && !cancelled) {
+        setState(() => error = 'ログインに失敗しました（${e.code}）');
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() => error = 'ログインに失敗しました');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => loading = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 400),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.fitness_center, size: 64),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'MUSCLE BUILDER',
+                    style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'ログインして、記録を仲間と共有しよう',
+                    style: TextStyle(color: Colors.grey.shade600),
+                  ),
+                  const SizedBox(height: 32),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 56,
+                    child: FilledButton.icon(
+                      onPressed: loading ? null : signInWithGoogle,
+                      icon: loading
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.login),
+                      label: const Text(
+                        'Googleでログイン',
+                        style: TextStyle(fontSize: 18),
+                      ),
+                    ),
+                  ),
+                  if (error != null) ...[
+                    const SizedBox(height: 16),
+                    Text(
+                      error!,
+                      style: const TextStyle(color: Colors.red),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -34,7 +178,7 @@ class MuscleBuilderApp extends StatelessWidget {
 // ============================================================
 
 class WorkoutRecord {
-  final String id; // 将来サーバー（Firestore）に送るときの識別子
+  final String id; // 共有投稿の識別にも使う
   final String exercise;
   final double weight; // kg
   final int reps;
@@ -86,32 +230,43 @@ class WorkoutRecord {
 }
 
 // ============================================================
-// 保存・読み込み（SharedPreferences に JSON で保存）
+// 保存・読み込み（アカウントごとに SharedPreferences へ保存）
 // ============================================================
 
 class RecordStore {
-  static const String _keyV2 = 'records_v2';
-  static const String _keyOld = 'records'; // 旧形式（文字列）
+  static const String _legacyV2 = 'records_v2'; // アカウント分け前の形式
+  static const String _keyOld = 'records'; // 最初の文字列形式
+
+  static String get _userKey =>
+      'records_v2_${FirebaseAuth.instance.currentUser?.uid ?? 'guest'}';
+
+  static List<WorkoutRecord> _decode(List<String> raw) {
+    final list = <WorkoutRecord>[];
+    for (final s in raw) {
+      try {
+        list.add(WorkoutRecord.fromJson(jsonDecode(s) as Map<String, dynamic>));
+      } catch (_) {
+        // 壊れたデータは読み飛ばす
+      }
+    }
+    return list;
+  }
 
   static Future<List<WorkoutRecord>> load() async {
     final prefs = await SharedPreferences.getInstance();
 
-    final raw = prefs.getStringList(_keyV2);
-    if (raw != null) {
-      final list = <WorkoutRecord>[];
-      for (final s in raw) {
-        try {
-          list.add(
-            WorkoutRecord.fromJson(jsonDecode(s) as Map<String, dynamic>),
-          );
-        } catch (_) {
-          // 壊れたデータは読み飛ばす
-        }
-      }
+    final raw = prefs.getStringList(_userKey);
+    if (raw != null) return _decode(raw);
+
+    // これまでの記録は、最初にログインしたアカウントへ引き継ぐ
+    final legacy = prefs.getStringList(_legacyV2);
+    if (legacy != null) {
+      final list = _decode(legacy);
+      await save(list);
+      await prefs.remove(_legacyV2);
       return list;
     }
 
-    // 旧形式からの引き継ぎ（初回のみ）
     final old = prefs.getStringList(_keyOld);
     if (old == null || old.isEmpty) return [];
 
@@ -138,16 +293,39 @@ class RecordStore {
     }
 
     await save(migrated);
+    await prefs.remove(_keyOld);
     return migrated;
   }
 
   static Future<void> save(List<WorkoutRecord> records) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(
-      _keyV2,
+      _userKey,
       records.map((r) => jsonEncode(r.toJson())).toList(),
     );
   }
+}
+
+// ============================================================
+// 共有（Firestore の posts コレクション）
+// ============================================================
+
+CollectionReference<Map<String, dynamic>> get postsRef =>
+    FirebaseFirestore.instance.collection('posts');
+
+/// 投稿のドキュメントID（同じ記録は何度共有しても1件になる）
+String postIdFor(String uid, String recordId) => '${uid}_$recordId';
+
+/// Firestore の投稿データ → WorkoutRecord
+WorkoutRecord recordFromPost(Map<String, dynamic> data, String fallbackId) {
+  return WorkoutRecord(
+    id: data['recordId'] as String? ?? fallbackId,
+    exercise: data['exercise'] as String? ?? '',
+    weight: (data['weight'] as num?)?.toDouble() ?? 0,
+    reps: (data['reps'] as num?)?.toInt() ?? 0,
+    durationMinutes: (data['durationMinutes'] as num?)?.toInt(),
+    createdAt: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+  );
 }
 
 // ============================================================
@@ -167,6 +345,7 @@ class _MainScreenState extends State<MainScreen> {
   final List<Widget> pages = const [
     HomeScreen(),
     WorkoutScreen(),
+    FeedScreen(),
     AiScreen(),
     TimerScreen(),
   ];
@@ -192,6 +371,11 @@ class _MainScreenState extends State<MainScreen> {
             icon: Icon(Icons.fitness_center_outlined),
             selectedIcon: Icon(Icons.fitness_center),
             label: '記録',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.groups_outlined),
+            selectedIcon: Icon(Icons.groups),
+            label: 'みんな',
           ),
           NavigationDestination(
             icon: Icon(Icons.auto_awesome_outlined),
@@ -247,18 +431,34 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final userName = FirebaseAuth.instance.currentUser?.displayName ?? 'ゲスト';
+
     return SafeArea(
       child: RefreshIndicator(
         onRefresh: loadRecords,
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
-            const Text(
-              'MUSCLE BUILDER',
-              style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'MUSCLE BUILDER',
+                    style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'ログアウト',
+                  icon: const Icon(Icons.logout),
+                  onPressed: () => FirebaseAuth.instance.signOut(),
+                ),
+              ],
             ),
             const SizedBox(height: 5),
-            Text('トレーニングを記録しよう', style: TextStyle(color: Colors.grey.shade600)),
+            Text(
+              '$userNameさん、トレーニングを記録しよう',
+              style: TextStyle(color: Colors.grey.shade600),
+            ),
             const SizedBox(height: 25),
 
             // 今日のトレーニング
@@ -399,7 +599,7 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 // ============================================================
-// トレーニング記録（追加・編集・削除）
+// トレーニング記録（追加・編集・削除・共有）
 // ============================================================
 
 class WorkoutScreen extends StatefulWidget {
@@ -432,14 +632,22 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
   List<String> exercises = [...defaultExercises];
   List<WorkoutRecord> records = [];
 
+  /// 共有済みの記録ID
+  Set<String> sharedIds = {};
+
+  String? get uid => FirebaseAuth.instance.currentUser?.uid;
+
   @override
   void initState() {
     super.initState();
     loadData();
+    loadSharedIds();
+    sharedVersion.addListener(loadSharedIds);
   }
 
   @override
   void dispose() {
+    sharedVersion.removeListener(loadSharedIds);
     weightController.dispose();
     repsController.dispose();
     durationController.dispose();
@@ -462,6 +670,67 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
         exercise = exercises.first;
       }
     });
+  }
+
+  /// 自分が共有している記録IDを Firestore から取得
+  Future<void> loadSharedIds() async {
+    final u = uid;
+    if (u == null) return;
+
+    try {
+      final snap = await postsRef.where('uid', isEqualTo: u).get();
+      if (!mounted) return;
+      setState(() {
+        sharedIds = snap.docs
+            .map((d) => d.data()['recordId'])
+            .whereType<String>()
+            .toSet();
+      });
+    } catch (_) {
+      // 読み込みに失敗しても、記録画面はそのまま使えるようにする
+    }
+  }
+
+  Map<String, dynamic> postData(WorkoutRecord r) {
+    final user = FirebaseAuth.instance.currentUser!;
+    return {
+      'uid': user.uid,
+      'userName': user.displayName ?? '名無しさん',
+      'recordId': r.id,
+      'exercise': r.exercise,
+      'weight': r.weight,
+      'reps': r.reps,
+      'durationMinutes': r.durationMinutes,
+      'createdAt': Timestamp.fromDate(r.createdAt),
+      'sharedAt': FieldValue.serverTimestamp(),
+    };
+  }
+
+  /// 共有する／共有を取り消す
+  Future<void> toggleShare(WorkoutRecord r) async {
+    final u = uid;
+    if (u == null) return;
+
+    final docRef = postsRef.doc(postIdFor(u, r.id));
+
+    try {
+      if (sharedIds.contains(r.id)) {
+        await docRef.delete();
+        sharedIds.remove(r.id);
+        if (!mounted) return;
+        setState(() {});
+        showMessage('共有を取り消しました');
+      } else {
+        await docRef.set(postData(r));
+        sharedIds.add(r.id);
+        if (!mounted) return;
+        setState(() {});
+        showMessage('みんなに共有しました！');
+      }
+    } on FirebaseException catch (e) {
+      if (!mounted) return;
+      showMessage('共有に失敗しました（${e.code}）');
+    }
   }
 
   Future<void> persist() async {
@@ -565,8 +834,18 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
   }
 
   Future<void> deleteRecord(int index) async {
+    final target = records[index];
     records.removeAt(index);
     await persist();
+
+    // 共有していた記録は、共有投稿もいっしょに消す
+    final u = uid;
+    if (u != null && sharedIds.contains(target.id)) {
+      try {
+        await postsRef.doc(postIdFor(u, target.id)).delete();
+        sharedIds.remove(target.id);
+      } catch (_) {}
+    }
 
     if (!mounted) return;
     setState(() {});
@@ -714,6 +993,15 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
     records[index] = result;
     await persist();
 
+    // 共有済みの記録は、共有投稿の内容も更新する
+    final u = uid;
+    if (u != null && sharedIds.contains(result.id)) {
+      try {
+        final data = postData(result)..remove('sharedAt');
+        await postsRef.doc(postIdFor(u, result.id)).update(data);
+      } catch (_) {}
+    }
+
     if (!mounted) return;
     setState(() {});
     showMessage('記録を更新しました');
@@ -752,6 +1040,8 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+
     return SafeArea(
       child: ListView(
         padding: const EdgeInsets.all(20),
@@ -845,6 +1135,11 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
             '記録一覧',
             style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
           ),
+          const SizedBox(height: 4),
+          Text(
+            '共有ボタンを押した記録だけが「みんな」に表示されます',
+            style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+          ),
           const SizedBox(height: 10),
 
           if (records.isEmpty)
@@ -858,6 +1153,7 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
             ...records.asMap().entries.map((entry) {
               final index = entry.key;
               final record = entry.value;
+              final shared = sharedIds.contains(record.id);
 
               return Card(
                 child: ListTile(
@@ -869,12 +1165,23 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       IconButton(
+                        tooltip: shared ? '共有を取り消す' : 'みんなに共有',
+                        visualDensity: VisualDensity.compact,
+                        icon: Icon(
+                          shared ? Icons.public : Icons.share_outlined,
+                          color: shared ? primary : null,
+                        ),
+                        onPressed: () => toggleShare(record),
+                      ),
+                      IconButton(
                         tooltip: '編集',
+                        visualDensity: VisualDensity.compact,
                         icon: const Icon(Icons.edit_outlined),
                         onPressed: () => editRecord(index),
                       ),
                       IconButton(
                         tooltip: '削除',
+                        visualDensity: VisualDensity.compact,
                         icon: const Icon(Icons.delete_outline),
                         onPressed: () => deleteRecord(index),
                       ),
@@ -884,6 +1191,122 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
               );
             }),
         ],
+      ),
+    );
+  }
+}
+
+// ============================================================
+// みんな（共有された記録のタイムライン）
+// ============================================================
+
+class FeedScreen extends StatelessWidget {
+  const FeedScreen({super.key});
+
+  Future<void> deletePost(BuildContext context, String docId) async {
+    try {
+      await postsRef.doc(docId).delete();
+      sharedVersion.value++;
+    } on FirebaseException catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('削除に失敗しました（${e.code}）')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final myUid = FirebaseAuth.instance.currentUser?.uid;
+
+    final stream = postsRef
+        .orderBy('sharedAt', descending: true)
+        .limit(50)
+        .snapshots();
+
+    return SafeArea(
+      child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: stream,
+        builder: (context, snapshot) {
+          final children = <Widget>[
+            const Text(
+              'みんなの記録',
+              style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '共有された最新のトレーニングです',
+              style: TextStyle(color: Colors.grey.shade600),
+            ),
+            const SizedBox(height: 20),
+          ];
+
+          if (snapshot.hasError) {
+            children.add(
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Text(
+                    '読み込みに失敗しました。\n${snapshot.error}',
+                    style: const TextStyle(color: Colors.red),
+                  ),
+                ),
+              ),
+            );
+          } else if (!snapshot.hasData) {
+            children.add(
+              const Padding(
+                padding: EdgeInsets.all(30),
+                child: Center(child: CircularProgressIndicator()),
+              ),
+            );
+          } else if (snapshot.data!.docs.isEmpty) {
+            children.add(
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(20),
+                  child: Text(
+                    'まだ共有された記録がありません。\n'
+                    '「記録」タブの共有ボタンから投稿してみよう！',
+                  ),
+                ),
+              ),
+            );
+          } else {
+            for (final doc in snapshot.data!.docs) {
+              final data = doc.data();
+              final record = recordFromPost(data, doc.id);
+              final userName = data['userName'] as String? ?? '名無しさん';
+              final isMine = data['uid'] == myUid;
+
+              children.add(
+                Card(
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      child: Text(
+                        userName.isEmpty ? '?' : userName.characters.first,
+                      ),
+                    ),
+                    title: Text(record.title),
+                    subtitle: Text('$userName ・ ${record.subtitle}'),
+                    trailing: isMine
+                        ? IconButton(
+                            tooltip: '共有を取り消す',
+                            icon: const Icon(Icons.delete_outline),
+                            onPressed: () => deletePost(context, doc.id),
+                          )
+                        : null,
+                  ),
+                ),
+              );
+            }
+          }
+
+          return ListView(
+            padding: const EdgeInsets.all(20),
+            children: children,
+          );
+        },
       ),
     );
   }

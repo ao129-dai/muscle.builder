@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "744241217152",
+    "project_id": "muscle-builder-4b2c5",
+    "storage_bucket": "muscle-builder-4b2c5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:744241217152:android:3a4648522e6c976935f065",
+        "android_client_info": {
+          "package_name": "com.example.muscle_builder"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "744241217152-qf3u5q9l8ab9tn40d7rjbrkhqou02snt.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCv23jmkCaF5KaLyk4WBCoWuDATXhHdbto"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "744241217152-qf3u5q9l8ab9tn40d7rjbrkhqou02snt.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
